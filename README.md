@@ -1,39 +1,47 @@
 # HSL Telegram Bot
 
-Телеграм-бот для общественного транспорта Хельсинки (HSL) на базе Digitransit API.
+A Telegram bot for Helsinki public transport (HSL), built on the Digitransit API.
 
-## Возможности
+## Features
 
-- Номер маршрута (550, 9, M1) + геопозиция → ближайшая остановка в каждом направлении, расстояние и ближайшие отправления.
-- Название места или адрес → до 3 вариантов маршрута с выбором кнопкой.
-- «Хочу поесть» / «где магазин одежды» → до 5 ближайших заведений по категории с маршрутом до каждого.
-- «Где ближайший Мак» / «хочу в New Yorker» → до 5 ближайших точек конкретной сети с маршрутом.
-- «Сколько осталось?» → время до прибытия и текущий отрезок пути по выбранному маршруту.
-- `/history` — последние 10 мест, можно построить маршрут снова.
-- Геопозиция и активный маршрут сохраняются в `data.json` и переживают перезапуск.
+- **Route number + location** (e.g. `550`, `9`, `M1`) — finds the nearest stop in each direction, with walking distance and upcoming departures.
+- **Place name or address** — builds up to 3 route options, selectable via inline buttons.
+- **"Хочу поесть" / "где магазин одежды"** (category search) — up to 5 nearby venues by category (food, clothing stores), each with a route.
+- **"Где ближайший Мак" / "хочу в New Yorker"** (brand search) — up to 5 nearest locations of a given chain, each with a route.
+- **"Сколько осталось?"** — time to arrival and current leg of the active route.
+- `/history` — last 10 destinations, reusable with one tap.
+- Location and active route persist across restarts in `data.json`.
 
-## Настройка
+## Requirements
+
+- Python 3.11+
+- A Telegram bot token ([@BotFather](https://t.me/BotFather))
+- A [Digitransit API](https://digitransit.fi/en/developers/apis/) subscription key
+
+## Setup
 
 ```bash
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
-cp .env.example .env   # заполнить TG_TOKEN, ROUTING_KEY, GEOCODE_KEY
+cp .env.example .env   # fill in TG_TOKEN, ROUTING_KEY, GEOCODE_KEY
 ```
 
-Переменные окружения:
+### Environment variables
 
-- `TG_TOKEN` — токен Telegram-бота.
-- `ROUTING_KEY` — ключ Digitransit Routing API.
-- `GEOCODE_KEY` — ключ Digitransit Geocoding API (если не задан, используется `ROUTING_KEY`).
+| Variable       | Description                                                              |
+|----------------|---------------------------------------------------------------------------|
+| `TG_TOKEN`     | Telegram bot token.                                                      |
+| `ROUTING_KEY`  | Digitransit Routing API key.                                             |
+| `GEOCODE_KEY`  | Digitransit Geocoding API key. Falls back to `ROUTING_KEY` if unset.     |
 
-## Запуск
+## Running
 
 ```bash
 set -a && . ./.env && set +a
 ./venv/bin/python bot.py
 ```
 
-## Автозапуск через systemd
+## Deployment (systemd)
 
 ```ini
 [Unit]
@@ -52,3 +60,12 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now hslbot
+```
+
+## License
+
+MIT
