@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import math
 import time
 import asyncio
 import logging
@@ -27,6 +28,11 @@ LOCATION_TTL = 10 * 60   # сколько секунд геопозиция сч
 SEARCH_RADIUS = 1500     # радиус поиска остановок, м
 HISTORY_SIZE = 10        # сколько мест помнить
 WALK_SPEED = 80          # м/мин
+FAVORITE_AFTER = 5       # после скольких поисков места оно становится избранным автоматически
+
+MONITOR_INTERVAL = 25        # сек между проверками геопозиции во время активного маршрута
+MONITOR_WARN_SOON = 2        # мин до "пора выходить" — порог первого предупреждения
+MONITOR_SHIFT_MIN = 5        # на сколько минут должен сдвинуться автобус, чтобы прислать апдейт
 
 MODE_RU = {"BUS": "Автобус", "TRAM": "Трамвай", "SUBWAY": "Метро",
            "RAIL": "Поезд", "FERRY": "Паром", "WALK": "Пешком"}
@@ -98,6 +104,37 @@ def fresh_location(u):
     if loc and time.time() - loc["ts"] < LOCATION_TTL:
         return loc
     return None
+
+
+# ---------- Избранные места ----------
+def norm_name(name):
+    return name.strip().lower()
+
+
+def is_favorite(u, name):
+    key = norm_name(name)
+    return any(norm_name(f["name"]) == key for f in u.get("favorites", []))
+
+
+def add_favorite(u, dest):
+    if is_favorite(u, dest["name"]):
+        return False
+    u.setdefault("favorites", []).append(
+        {"name": dest["name"], "lat": dest["lat"], "lon": dest["lon"]})
+    return True
+
+
+def bump_search_count(u, dest):
+    """Считает повторные поиски места; при превышении FAVORITE_AFTER добавляет в избранное."""
+    if is_favorite(u, dest["name"]):
+        return False
+    counts = u.setdefault("fav_counts", {})
+    key = norm_name(dest["name"])
+    counts[key] = counts.get(key, 0) + 1
+    if counts[key] > FAVORITE_AFTER:
+        counts.pop(key, None)
+        return add_favorite(u, dest)
+    return False
 
 
 # ---------- Время ----------
@@ -180,11 +217,21 @@ query($from: InputCoordinates!, $to: InputCoordinates!, $n: Int!) {
       startTime endTime
       legs {
         mode startTime endTime distance
-        from { name stop { code } }
-        to { name }
+        from { name lat lon stop { code } }
+        to { name lat lon stop { gtfsId } }
         route { shortName }
-        trip { tripHeadsign }
+        trip { gtfsId tripHeadsign }
       }
+    }
+  }
+}"""
+
+BOARD_Q = """
+query($id: String!) {
+  stop(id: $id) {
+    stoptimesWithoutPatterns(numberOfDepartures: 40, timeRange: 10800, omitNonPickups: true) {
+      serviceDay realtimeDeparture realtime
+      trip { gtfsId }
     }
   }
 }"""
@@ -232,12 +279,48 @@ def plan(origin, dest, n=3):
                 "mode": l["mode"],
                 "start": l["startTime"] // 1000, "end": l["endTime"] // 1000,
                 "from": l["from"]["name"], "to": l["to"]["name"],
+                "from_lat": l["from"]["lat"], "from_lon": l["from"]["lon"],
+                "to_lat": l["to"]["lat"], "to_lon": l["to"]["lon"],
                 "code": (l["from"].get("stop") or {}).get("code"),
+                "stop_id": (l["to"].get("stop") or {}).get("gtfsId"),
                 "route": (l.get("route") or {}).get("shortName"),
                 "headsign": (l.get("trip") or {}).get("tripHeadsign"),
+                "trip_id": (l.get("trip") or {}).get("gtfsId"),
                 "distance": int(l.get("distance") or 0)})
         result.append({"start": it["startTime"] // 1000, "end": it["endTime"] // 1000, "legs": legs})
     return result
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    r = 6371000
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def boarding_departure(stop_id, trip_id):
+    """Актуальное (realtime) отправление конкретного рейса с посадочной остановки."""
+    times = gql(BOARD_Q, {"id": stop_id})["stop"]["stoptimesWithoutPatterns"]
+    for st in times:
+        if st["trip"]["gtfsId"] == trip_id:
+            return st["serviceDay"] + st["realtimeDeparture"], st["realtime"]
+    return None
+
+
+def walk_target(trip):
+    """Если сейчас надо идти пешком к посадке на транспорт — куда идти и на какой рейс."""
+    legs = trip["legs"]
+    if not legs or legs[0]["mode"] != "WALK":
+        return None
+    nxt = legs[1] if len(legs) > 1 else None
+    if not nxt or not nxt.get("trip_id") or not legs[0].get("stop_id"):
+        return None
+    return {"lat": legs[0]["to_lat"], "lon": legs[0]["to_lon"],
+            "stop_id": legs[0]["stop_id"], "trip_id": nxt["trip_id"],
+            "planned_departure": nxt["start"],
+            "route": nxt.get("route"), "headsign": nxt.get("headsign")}
 
 
 def dedupe_pois(pois, min_sep=0.05):
@@ -346,6 +429,7 @@ def remaining_report(u):
     dest = trip["dest"]["name"]
     if now > trip["end"] + 120:
         u.pop("active_trip", None)
+        u.pop("monitor", None)
         save_data()
         return f"По плану ты уже приехал в {dest} (в {fmt(trip['end'])}). Маршрут закрыт."
 
@@ -379,12 +463,17 @@ async def send_plan(msg, u, dest, loc):
         await msg.reply_text("Маршрутов не нашлось.")
         return
     u["pending_plans"] = {"dest": dest, "its": its}
+    auto_added = bump_search_count(u, dest)
     save_data()
     text = f"Маршруты до {dest['name']}:\n\n" + "\n\n".join(
         format_itinerary(it, i + 1) for i, it in enumerate(its))
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Еду №{i + 1}", callback_data=f"pick:{i}")
-                                for i in range(len(its))]])
-    await msg.reply_text(text, reply_markup=kb)
+    if auto_added:
+        text += f"\n\n⭐ «{dest['name']}» добавлено в избранное — ты искал это место больше {FAVORITE_AFTER} раз."
+    rows = [[InlineKeyboardButton(f"Еду №{i + 1}", callback_data=f"pick:{i}")
+             for i in range(len(its))]]
+    if not auto_added and not is_favorite(u, dest["name"]):
+        rows.append([InlineKeyboardButton("⭐ Добавить в избранное", callback_data="favadd")])
+    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def send_poi_options(msg, u, pois, loc, title):
@@ -424,6 +513,63 @@ async def ask_location(msg, what):
     await msg.reply_text(f"Скинь геопозицию, и я покажу {what}.", reply_markup=GEO_KB)
 
 
+LIVE_LOCATION_HINT = (
+    "Совет: включи трансляцию геопозиции (скрепка → «Геопозиция» → «Трансляция геопозиции», можно на весь путь) — "
+    "тогда я буду следить по факту твоего пути и предупрежу, если автобус опоздает или приедет раньше.")
+
+
+async def maybe_suggest_live_location(msg, u):
+    loc = u.get("location") or {}
+    if loc.get("live_until", 0) <= time.time():
+        await msg.reply_text(LIVE_LOCATION_HINT)
+
+
+# ---------- Мониторинг пути по геопозиции ----------
+async def monitor_tick(ctx: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    for chat_id, u in list(DATA.items()):
+        trip = u.get("active_trip")
+        loc = u.get("location")
+        if not trip or not loc or loc.get("live_until", 0) < now:
+            continue
+        if now > trip["end"] + 120:
+            continue
+        target = walk_target(trip)
+        if not target:
+            continue
+        try:
+            result = await asyncio.to_thread(boarding_departure, target["stop_id"], target["trip_id"])
+        except Exception:
+            log.exception("monitor: не удалось получить realtime для рейса")
+            continue
+        dep = result[0] if result else target["planned_departure"]
+        dist = haversine_m(loc["lat"], loc["lon"], target["lat"], target["lon"])
+        margin_min = (dep - dist / WALK_SPEED * 60 - now) / 60
+
+        state = u.setdefault("monitor", {})
+        last = state.get("last_margin")
+        state["last_margin"] = margin_min
+        save_data()
+
+        route = target["route"] or ""
+        head = f" → {target['headsign']}" if target.get("headsign") else ""
+        alert = None
+        if margin_min <= 0 and (last is None or last > 0):
+            alert = f"🏃 Пора выходить прямо сейчас — на {route}{head}."
+        elif margin_min <= MONITOR_WARN_SOON and (last is None or last > MONITOR_WARN_SOON):
+            alert = f"⏰ Через {round(margin_min)} мин пора выходить — на {route}{head}."
+        elif last is not None and margin_min - last >= MONITOR_SHIFT_MIN:
+            alert = f"🟢 {route}{head} задерживается — можно выйти на {round(margin_min - last)} мин позже."
+        elif last is not None and last - margin_min >= MONITOR_SHIFT_MIN:
+            alert = f"🔴 {route}{head} едет быстрее расписания — выходи на {round(last - margin_min)} мин раньше."
+
+        if alert:
+            try:
+                await ctx.bot.send_message(int(chat_id), alert)
+            except Exception:
+                log.exception("monitor: не удалось отправить сообщение")
+
+
 # ---------- Обработчики ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
@@ -433,7 +579,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• «Хочу поесть» или «где магазин одежды»: покажу до 5 ближайших вариантов с маршрутом.\n"
         "• «Где ближайший Мак» или «хочу в New Yorker»: найду ближайшие точки этой сети.\n"
         "• «Сколько осталось?»: сколько ехать по выбранному маршруту.\n"
-        "• /history: последние места, /stop: закончить маршрут.",
+        f"• ⭐ под маршрутом добавляет место в избранное; ищешь его больше {FAVORITE_AFTER} раз — добавится само.\n"
+        "• /history: последние места, /favorites: избранные, /stop: закончить маршрут.",
         reply_markup=GEO_KB)
 
 
@@ -448,9 +595,23 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Куда поедем снова?", reply_markup=kb)
 
 
+async def cmd_favorites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = user(update.effective_chat.id)
+    favs = u.get("favorites", [])
+    if not favs:
+        await update.effective_message.reply_text(
+            "Избранных мест пока нет. Добавь кнопкой «⭐» под маршрутом — "
+            f"или просто ищи одно и то же место больше {FAVORITE_AFTER} раз, и оно добавится само.")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f["name"][:60], callback_data=f"fav:{i}")]
+                               for i, f in enumerate(favs)])
+    await update.effective_message.reply_text("Избранные места:", reply_markup=kb)
+
+
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = user(update.effective_chat.id)
     u.pop("active_trip", None)
+    u.pop("monitor", None)
     save_data()
     await update.effective_message.reply_text("Маршрут закончен.")
 
@@ -459,7 +620,13 @@ async def on_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     u = user(msg.chat_id)
     loc = msg.location
-    u["location"] = {"lat": loc.latitude, "lon": loc.longitude, "ts": time.time()}
+    live_until = (u.get("location") or {}).get("live_until", 0)
+    if loc.live_period:   # приходит только в первом сообщении трансляции
+        live_until = time.time() + loc.live_period
+    entry = {"lat": loc.latitude, "lon": loc.longitude, "ts": time.time()}
+    if live_until > time.time():
+        entry["live_until"] = live_until
+    u["location"] = entry
     save_data()
     if update.edited_message:      # обновления трансляции геопозиции: просто запоминаем
         return
@@ -540,12 +707,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         it = pp["its"][int(arg)]
         dest = pp["dest"]
         u["active_trip"] = {"dest": dest, **it}
+        u.pop("monitor", None)
         u["history"] = ([dest] + [h for h in u.get("history", []) if h["name"] != dest["name"]])[:HISTORY_SIZE]
         u.pop("pending_plans", None)
         save_data()
         await q.message.reply_text(
             f"Запомнил вариант {int(arg) + 1}. Прибытие в {fmt(it['end'])}.\n"
             f"Спроси «сколько осталось» в любой момент.")
+        await maybe_suggest_live_location(q.message, u)
 
     elif kind == "poi":
         options = u.get("pending_pois")
@@ -556,18 +725,44 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         poi, it = opt["poi"], opt["it"]
         dest = {"name": poi["name"], "lat": poi["lat"], "lon": poi["lon"]}
         u["active_trip"] = {"dest": dest, **it}
+        u.pop("monitor", None)
         u["history"] = ([dest] + [h for h in u.get("history", []) if h["name"] != dest["name"]])[:HISTORY_SIZE]
         u.pop("pending_pois", None)
         save_data()
         await q.message.reply_text(
             f"Запомнил: едешь в {dest['name']}. Прибытие в {fmt(it['end'])}.\n"
             f"Спроси «сколько осталось» в любой момент.")
+        await maybe_suggest_live_location(q.message, u)
 
     elif kind == "hist":
         hist = u.get("history", [])
         if int(arg) >= len(hist):
             return
         dest = hist[int(arg)]
+        loc = fresh_location(u)
+        if loc:
+            await send_plan(q.message, u, dest, loc)
+        else:
+            u["pending_dest"] = dest
+            save_data()
+            await ask_location(q.message, f"маршрут до {dest['name']}")
+
+    elif kind == "favadd":
+        pp = u.get("pending_plans")
+        if not pp:
+            await q.message.reply_text("Эти варианты устарели, построй маршрут заново.")
+            return
+        if add_favorite(u, pp["dest"]):
+            save_data()
+            await q.message.reply_text(f"⭐ «{pp['dest']['name']}» добавлено в избранное.")
+        else:
+            await q.message.reply_text("Уже в избранном.")
+
+    elif kind == "fav":
+        favs = u.get("favorites", [])
+        if int(arg) >= len(favs):
+            return
+        dest = favs[int(arg)]
         loc = fresh_location(u)
         if loc:
             await send_plan(q.message, u, dest, loc)
@@ -588,11 +783,13 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("favorites", cmd_favorites))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(on_error)
+    app.job_queue.run_repeating(monitor_tick, interval=MONITOR_INTERVAL, first=MONITOR_INTERVAL)
     log.info("Бот запущен")
     app.run_polling()
 

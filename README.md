@@ -10,6 +10,8 @@ A Telegram bot for Helsinki public transport (HSL), built on the Digitransit API
 - **"Где ближайший Мак" / "хочу в New Yorker"** (brand search) — up to 5 nearest locations of a given chain, each with a route.
 - **"Сколько осталось?"** — time to arrival and current leg of the active route.
 - `/history` — last 10 destinations, reusable with one tap.
+- **Favorites** — add a place via the "⭐ Add to favorites" button under any route, or just search the same place more than 5 times and it's added automatically. `/favorites` lists them for one-tap routing.
+- **GPS-aware "time to leave" alerts** — if you share a Telegram *live location* (clip icon → Location → Share Live Location) while a route is active, the bot re-checks the real-time departure of your boarding vehicle and your actual walking distance every ~25s, and proactively messages you if it's time to leave, or if the vehicle is running late/early enough to change that. Without live location, it only answers "how much time is left" by schedule/realtime on request, same as before — bots can't request live location via a button, only a one-off point, so this has to be started manually by the user.
 - Location and active route persist across restarts in `data.json`.
 
 ## Requirements
